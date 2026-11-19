@@ -24,6 +24,10 @@
 // baseview-window and a raw-CAMetalLayer constructor.
 #[cfg(not(target_os = "ios"))]
 pub mod editor;
+/// OpenGL editor for Intel binaries running macOS 13 and earlier.
+/// Apple silicon builds do not compile this module.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+mod gl_editor;
 pub mod font;
 pub mod platform;
 #[cfg(target_os = "windows")]

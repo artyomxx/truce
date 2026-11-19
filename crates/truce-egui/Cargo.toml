@@ -40,6 +40,19 @@ baseview = { workspace = true }
 objc = "0.2"
 wgpu = { workspace = true, features = ["metal"] }
 
+# Intel binaries on macOS 13 and earlier paint with OpenGL. arm64 does
+# not depend on these crates, so that binary does not link OpenGL.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+egui_glow = { version = "0.34", default-features = false }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSOpenGL",
+    "NSOpenGLView",
+    "NSResponder",
+    "NSView",
+    "objc2-open-gl",
+] }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry"] }

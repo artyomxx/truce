@@ -1,10 +1,11 @@
-//! egui-wgpu rendering backend.
+//! egui rendering backend.
 //!
-//! Manages the wgpu device, surface, and egui-wgpu `Renderer`. Each frame,
-//! takes egui's tessellated output and paints it onto the window surface.
+//! Metal/Vulkan/DX12 go through wgpu. Intel macOS 13 and earlier paints
+//! with OpenGL (`gl_editor`) because the Metal shader compiler dies on
+//! those machines. `EguiRenderer` forwards to whichever one was created.
 
 /// Wraps wgpu + egui-wgpu for rendering egui output to a window surface.
-pub struct EguiRenderer {
+struct WgpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
@@ -45,7 +46,7 @@ fn editor_present_mode() -> wgpu::PresentMode {
     }
 }
 
-impl EguiRenderer {
+impl WgpuRenderer {
     /// Create from a baseview `Window` by bridging its rwh 0.5 handle
     /// to wgpu's rwh 0.6 via `SurfaceTargetUnsafe::RawHandle`.
     ///
@@ -391,5 +392,132 @@ impl EguiRenderer {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface.configure(&self.device, &self.surface_config);
+    }
+}
+
+/// Window-surface renderer. Holds either the wgpu backend or, on Intel
+/// macOS 13 and earlier, the OpenGL backend.
+pub struct EguiRenderer {
+    inner: RendererInner,
+}
+
+enum RendererInner {
+    Wgpu(WgpuRenderer),
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    Gl(crate::gl_editor::GlEditor),
+}
+
+impl EguiRenderer {
+    fn from_wgpu(renderer: WgpuRenderer) -> Self {
+        Self {
+            inner: RendererInner::Wgpu(renderer),
+        }
+    }
+
+    /// Create from a baseview `Window`.
+    ///
+    /// On Intel macOS 13 and earlier this attaches an OpenGL context to
+    /// the window and paints with `egui_glow`. Every other desktop target
+    /// builds the wgpu surface.
+    ///
+    /// # Safety
+    /// The window must remain valid for the lifetime of the renderer.
+    #[cfg(not(any(target_os = "ios", target_os = "windows")))]
+    #[must_use]
+    pub unsafe fn from_window(
+        window: &baseview::Window,
+        width: u32,
+        height: u32,
+        device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        if crate::gl_editor::legacy_intel_gl() {
+            return match crate::gl_editor::GlEditor::new(window, width, height) {
+                Ok(gl) => Some(Self {
+                    inner: RendererInner::Gl(gl),
+                }),
+                Err(err) => {
+                    eprintln!("OpenGL editor failed to start: {err}");
+                    None
+                }
+            };
+        }
+        unsafe { WgpuRenderer::from_window(window, width, height, device_lost) }
+            .map(Self::from_wgpu)
+    }
+
+    /// Adapter/device/swapchain setup for the Windows render thread.
+    /// macOS and Linux call `WgpuRenderer::init_with_surface` from
+    /// `from_window` instead.
+    ///
+    /// # Safety
+    /// `surface` must have been created against a window that outlives
+    /// the returned renderer.
+    #[cfg(target_os = "windows")]
+    pub(crate) unsafe fn init_with_surface(
+        instance: &wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+        device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<Self> {
+        unsafe { WgpuRenderer::init_with_surface(instance, surface, width, height, device_lost) }
+            .map(Self::from_wgpu)
+    }
+
+    /// Create from a raw `CAMetalLayer` pointer (AAX native view path
+    /// on macOS, `AUv3` `UIView` path on iOS).
+    ///
+    /// # Safety
+    /// `metal_layer` must be a valid `CAMetalLayer*` that remains alive for
+    /// the lifetime of the renderer.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub unsafe fn from_metal_layer(
+        metal_layer: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        unsafe { WgpuRenderer::from_metal_layer(metal_layer, width, height) }.map(Self::from_wgpu)
+    }
+
+    /// Paint a frame of egui output to the surface.
+    pub fn render(
+        &mut self,
+        textures_delta: &egui::TexturesDelta,
+        clipped_primitives: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+    ) {
+        match &mut self.inner {
+            RendererInner::Wgpu(renderer) => {
+                renderer.render(textures_delta, clipped_primitives, pixels_per_point);
+            }
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            RendererInner::Gl(renderer) => {
+                renderer.render(textures_delta, clipped_primitives, pixels_per_point);
+            }
+        }
+    }
+
+    /// How long the last `render` blocked in the swapchain acquire.
+    /// The OpenGL path presents inside `flushBuffer` and reports no wait,
+    /// so the editor's pacer does not add a second delay on top of vsync.
+    #[must_use]
+    pub fn acquire_wait(&self) -> std::time::Duration {
+        match &self.inner {
+            RendererInner::Wgpu(renderer) => renderer.acquire_wait(),
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            RendererInner::Gl(_) => std::time::Duration::ZERO,
+        }
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        match &mut self.inner {
+            RendererInner::Wgpu(renderer) => renderer.resize(width, height),
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            RendererInner::Gl(renderer) => renderer.resize(width, height),
+        }
     }
 }
